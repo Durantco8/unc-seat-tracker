@@ -1,6 +1,6 @@
 """Database setup and query helpers using SQLAlchemy Core + SQLite."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import sqlalchemy as sa
 
@@ -51,8 +51,10 @@ notifications = sa.Table(
         nullable=False,
     ),
     sa.Column("message", sa.Text, nullable=False),
-    sa.Column("sent_at", sa.DateTime, nullable=False),
-    sa.Column("status", sa.Text, nullable=False),  # "sent" or "failed"
+    sa.Column("sent_at", sa.DateTime),              # null until actually sent
+    sa.Column("status", sa.Text, nullable=False),   # pending / sent / failed / dead
+    sa.Column("attempts", sa.Integer, nullable=False, server_default=sa.text("0")),
+    sa.Column("next_retry_at", sa.DateTime),        # null = no retry needed
 )
 
 
@@ -125,3 +127,97 @@ def upsert_section(conn, status) -> tuple[int, int | None]:
         )
     )
     return result.inserted_primary_key[0], None
+
+
+def get_active_watchers(conn, section_id: int) -> list[sa.Row]:
+    """Return all active watches for a given section."""
+    return conn.execute(
+        sa.select(watches).where(
+            watches.c.section_id == section_id,
+            watches.c.active == True,  # noqa: E712
+        )
+    ).fetchall()
+
+
+def create_notification(conn, watch_id: int, message: str) -> int:
+    """Insert a pending notification. Returns the notification id."""
+    result = conn.execute(
+        notifications.insert().values(
+            watch_id=watch_id,
+            message=message,
+            status="pending",
+        )
+    )
+    return result.inserted_primary_key[0]
+
+
+def get_pending_notifications(conn) -> list[sa.Row]:
+    """Return notifications that are ready to send or retry.
+
+    Includes 'pending' (never attempted) and 'failed' (past their retry time).
+    """
+    now = datetime.now(timezone.utc)
+    return conn.execute(
+        sa.select(
+            notifications,
+            watches.c.user_email,
+            sections.c.subject,
+            sections.c.catalog_number,
+            sections.c.class_section,
+            sections.c.description,
+        )
+        .select_from(
+            notifications
+            .join(watches, notifications.c.watch_id == watches.c.id)
+            .join(sections, watches.c.section_id == sections.c.id)
+        )
+        .where(
+            sa.or_(
+                notifications.c.status == "pending",
+                sa.and_(
+                    notifications.c.status == "failed",
+                    notifications.c.next_retry_at <= now,
+                ),
+            )
+        )
+    ).fetchall()
+
+
+MAX_ATTEMPTS = 5
+
+
+def mark_notification_sent(conn, notification_id: int) -> None:
+    """Mark a notification as successfully sent."""
+    conn.execute(
+        notifications.update()
+        .where(notifications.c.id == notification_id)
+        .values(
+            status="sent",
+            sent_at=datetime.now(timezone.utc),
+            attempts=notifications.c.attempts + 1,
+            next_retry_at=None,
+        )
+    )
+
+
+def mark_notification_failed(conn, notification_id: int, attempts: int) -> None:
+    """Mark a notification as failed, with backoff or dead-letter."""
+    new_attempts = attempts + 1
+    if new_attempts >= MAX_ATTEMPTS:
+        status = "dead"
+        next_retry = None
+    else:
+        status = "failed"
+        # Exponential backoff: 2^attempts minutes (2, 4, 8, 16 min)
+        backoff_seconds = (2 ** new_attempts) * 60
+        next_retry = datetime.now(timezone.utc) + timedelta(seconds=backoff_seconds)
+
+    conn.execute(
+        notifications.update()
+        .where(notifications.c.id == notification_id)
+        .values(
+            status=status,
+            attempts=new_attempts,
+            next_retry_at=next_retry,
+        )
+    )

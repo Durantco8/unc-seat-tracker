@@ -7,6 +7,7 @@ from collections import defaultdict
 import sqlalchemy as sa
 
 from seat_tracker.db import create_engine, init_db, sections, watches, upsert_section
+from seat_tracker.notifier import create_seat_notifications, process_pending_notifications
 from seat_tracker.scraper import check_seats
 
 log = logging.getLogger(__name__)
@@ -32,6 +33,7 @@ def run_poll_loop(
     interval_seconds: int = 180,
     request_delay: float = 1.5,
     max_consecutive_failures: int = 3,
+    send_fn=None,
 ) -> None:
     """Poll all watched courses in a loop.
 
@@ -55,8 +57,19 @@ def run_poll_loop(
         interval_seconds, request_delay, max_consecutive_failures,
     )
 
+    # Default to real email sender; tests inject a fake
+    if send_fn is None:
+        from seat_tracker.notifier import send_email
+        send_fn = send_email
+
     while True:
         pass_start = time.monotonic()
+
+        # Retry any failed notifications from previous passes
+        with engine.begin() as conn:
+            sent, failed = process_pending_notifications(conn, send_fn=send_fn)
+            if sent or failed:
+                log.info("Notification retry: %d sent, %d failed", sent, failed)
 
         with engine.begin() as conn:
             courses = get_watched_courses(conn)
@@ -109,6 +122,21 @@ def run_poll_loop(
                                 subject, catalog_number, status.class_section,
                                 old_seats, status.available_seats,
                             )
+                        # Create notifications on 0 → >0 transitions
+                        if old_seats is not None:
+                            created = create_seat_notifications(
+                                conn, section_id, old_seats, status.available_seats,
+                            )
+                            if created:
+                                log.info("Queued %d notification(s)", created)
+
+                # Send any notifications we just created (plus retries handled above)
+                with engine.begin() as conn:
+                    sent, failed = process_pending_notifications(
+                        conn, send_fn=send_fn,
+                    )
+                    if sent or failed:
+                        log.info("Notifications: %d sent, %d failed", sent, failed)
 
             # If every course failed, the server might be down — double the sleep
             if all_failed and active_courses:
