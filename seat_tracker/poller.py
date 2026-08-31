@@ -3,6 +3,7 @@
 import logging
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import sqlalchemy as sa
 
@@ -28,9 +29,19 @@ def get_watched_courses(conn) -> list[tuple[str, str, str]]:
     return [(row.term, row.subject, row.catalog_number) for row in conn.execute(query)]
 
 
+def _scrape_one(scrape_fn, term, subject, catalog_number):
+    """Scrape a single course. Runs in a worker thread."""
+    results = scrape_fn(term, subject, catalog_number)
+    return (term, subject, catalog_number), results
+
+
 def run_poll_pass(engine, *, scrape_fn, send_fn, failures, suspended,
-                  max_consecutive_failures, request_delay):
+                  max_consecutive_failures, request_delay, max_workers=5):
     """Execute a single polling pass over all watched courses.
+
+    Scrapes are dispatched to a thread pool (max_workers concurrent requests).
+    DB writes and notifications happen on the main thread after each scrape
+    completes, since SQLite only allows one writer at a time.
 
     Returns True if at least one course was polled successfully.
     """
@@ -49,64 +60,70 @@ def run_poll_pass(engine, *, scrape_fn, send_fn, failures, suspended,
 
     active_courses = [c for c in courses if c not in suspended]
     log.info(
-        "Polling %d course(s) (%d suspended)",
-        len(active_courses), len(courses) - len(active_courses),
+        "Polling %d course(s) (%d suspended, %d workers)",
+        len(active_courses), len(courses) - len(active_courses), max_workers,
     )
 
     all_failed = True
 
-    for i, (term, subject, catalog_number) in enumerate(active_courses):
-        course_key = (term, subject, catalog_number)
-
-        # Politeness delay between requests (not before the first one)
-        if i > 0:
-            time.sleep(request_delay)
-
-        try:
-            results = scrape_fn(term, subject, catalog_number)
-        except Exception:
-            failures[course_key] += 1
-            log.exception(
-                "Failed to poll %s %s %s (failure %d/%d)",
-                subject, catalog_number, term,
-                failures[course_key], max_consecutive_failures,
+    # Dispatch all scrapes to the thread pool
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        future_to_course = {}
+        for term, subject, catalog_number in active_courses:
+            future = pool.submit(
+                _scrape_one, scrape_fn, term, subject, catalog_number,
             )
-            if failures[course_key] >= max_consecutive_failures:
-                log.warning(
-                    "Suspending %s %s %s after %d consecutive failures",
-                    subject, catalog_number, term, max_consecutive_failures,
+            future_to_course[future] = (term, subject, catalog_number)
+
+        # Process results as they complete (not in submission order)
+        for future in as_completed(future_to_course):
+            course_key = future_to_course[future]
+            term, subject, catalog_number = course_key
+
+            try:
+                _, results = future.result()
+            except Exception:
+                failures[course_key] += 1
+                log.exception(
+                    "Failed to poll %s %s %s (failure %d/%d)",
+                    subject, catalog_number, term,
+                    failures[course_key], max_consecutive_failures,
                 )
-                suspended.add(course_key)
-            continue
-
-        # Success — reset failure counter
-        failures[course_key] = 0
-        all_failed = False
-
-        with engine.begin() as conn:
-            for status in results:
-                section_id, old_seats = upsert_section(conn, status)
-                if old_seats is not None and old_seats != status.available_seats:
-                    log.info(
-                        "%s %s section %s: %d → %d seats",
-                        subject, catalog_number, status.class_section,
-                        old_seats, status.available_seats,
+                if failures[course_key] >= max_consecutive_failures:
+                    log.warning(
+                        "Suspending %s %s %s after %d consecutive failures",
+                        subject, catalog_number, term, max_consecutive_failures,
                     )
-                # Create notifications on 0 → >0 transitions
-                if old_seats is not None:
-                    created = create_seat_notifications(
-                        conn, section_id, old_seats, status.available_seats,
-                    )
-                    if created:
-                        log.info("Queued %d notification(s)", created)
+                    suspended.add(course_key)
+                continue
 
-        # Send any notifications we just created
-        with engine.begin() as conn:
-            sent, failed = process_pending_notifications(
-                conn, send_fn=send_fn,
-            )
-            if sent or failed:
-                log.info("Notifications: %d sent, %d failed", sent, failed)
+            # Success — reset failure counter
+            failures[course_key] = 0
+            all_failed = False
+
+            # DB writes on main thread (SQLite = one writer at a time)
+            with engine.begin() as conn:
+                for status in results:
+                    section_id, old_seats = upsert_section(conn, status)
+                    if old_seats is not None and old_seats != status.available_seats:
+                        log.info(
+                            "%s %s section %s: %d → %d seats",
+                            subject, catalog_number, status.class_section,
+                            old_seats, status.available_seats,
+                        )
+                    if old_seats is not None:
+                        created = create_seat_notifications(
+                            conn, section_id, old_seats, status.available_seats,
+                        )
+                        if created:
+                            log.info("Queued %d notification(s)", created)
+
+            with engine.begin() as conn:
+                sent, failed = process_pending_notifications(
+                    conn, send_fn=send_fn,
+                )
+                if sent or failed:
+                    log.info("Notifications: %d sent, %d failed", sent, failed)
 
     return not all_failed or not active_courses
 
@@ -116,6 +133,7 @@ def run_poll_loop(
     interval_seconds: int = 180,
     request_delay: float = 1.5,
     max_consecutive_failures: int = 3,
+    max_workers: int = 5,
     send_fn=None,
     scrape_fn=None,
 ) -> None:
@@ -125,8 +143,10 @@ def run_poll_loop(
         db_path: Path to the SQLite database file.
         interval_seconds: Seconds between the start of each full pass (default 3 min).
         request_delay: Seconds to sleep between individual HTTP requests (politeness).
+            Now applied as a stagger between thread pool submissions.
         max_consecutive_failures: After this many consecutive failures for a single
             course, skip it for the rest of this process's lifetime.
+        max_workers: Maximum concurrent scrape threads.
         send_fn: Callable(to, subject, body) for sending notifications.
         scrape_fn: Callable(term, subject, catalog_number) -> list[SectionStatus].
     """
@@ -143,8 +163,8 @@ def run_poll_loop(
     suspended: set[tuple] = set()
 
     log.info(
-        "Poller starting (interval=%ds, delay=%.1fs, max_failures=%d)",
-        interval_seconds, request_delay, max_consecutive_failures,
+        "Poller starting (interval=%ds, workers=%d, max_failures=%d)",
+        interval_seconds, max_workers, max_consecutive_failures,
     )
 
     while True:
@@ -158,6 +178,7 @@ def run_poll_loop(
             suspended=suspended,
             max_consecutive_failures=max_consecutive_failures,
             request_delay=request_delay,
+            max_workers=max_workers,
         )
 
         if not success:
