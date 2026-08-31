@@ -105,6 +105,89 @@ def create_app(db_path: str = "seat_tracker.db") -> Flask:
             },
         }), 201
 
+    # ── POST /watches/course ───────────────────────────────────────────
+
+    @app.post("/watches/course")
+    def add_course_watch():
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Request body must be JSON"}), 400
+
+        required = ["email", "term", "subject", "catalog_number"]
+        missing = [f for f in required if not data.get(f)]
+        if missing:
+            return jsonify({"error": f"Missing fields: {', '.join(missing)}"}), 400
+
+        email = data["email"]
+        term = data["term"]
+        subject = data["subject"].upper()
+        catalog_number = data["catalog_number"]
+
+        # Scrape to get all sections for this course
+        try:
+            results = check_seats(term, subject, catalog_number)
+        except Exception:
+            return jsonify({"error": "Failed to look up course from UNC"}), 502
+
+        if not results:
+            return jsonify({
+                "error": f"No sections found for {subject} {catalog_number} in {term}"
+            }), 404
+
+        # Upsert all sections
+        with engine.begin() as conn:
+            for status in results:
+                upsert_section(conn, status)
+
+        # Create a watch for each section, tracking results
+        section_results = []
+        created_count = 0
+
+        for status in results:
+            with engine.connect() as conn:
+                section = get_section_by_identity(
+                    conn, term, subject, catalog_number, status.class_section,
+                )
+
+            try:
+                with engine.begin() as conn:
+                    conn.execute(
+                        watches.insert().values(
+                            section_id=section.id,
+                            user_email=email,
+                            created_at=datetime.now(timezone.utc),
+                            active=True,
+                        )
+                    )
+                section_results.append({
+                    "class_section": status.class_section,
+                    "status": "created",
+                    "available_seats": status.available_seats,
+                })
+                created_count += 1
+            except sa.exc.IntegrityError:
+                section_results.append({
+                    "class_section": status.class_section,
+                    "status": "already_watching",
+                    "available_seats": status.available_seats,
+                })
+
+        if created_count == 0:
+            return jsonify({
+                "message": "Already watching all sections",
+                "sections": section_results,
+            }), 409
+
+        already = len(results) - created_count
+        msg = f"Created {created_count} watch(es)"
+        if already:
+            msg += f", {already} already existed"
+
+        return jsonify({
+            "message": msg,
+            "sections": section_results,
+        }), 201
+
     # ── GET /watches?email=... ──────────────────────────────────────────
 
     @app.get("/watches")

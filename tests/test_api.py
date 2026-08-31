@@ -33,6 +33,20 @@ def _seed_section(app, seats=10):
     return section_id
 
 
+def _seed_two_sections(app):
+    """Insert two sections (001 and 002) for COMP 311."""
+    engine = app.config["DB_ENGINE"]
+    for section, seats in [("001", 10), ("002", 3)]:
+        status = SectionStatus(
+            term="2026 Fall", subject="COMP", catalog_number="311",
+            class_section=section, class_number="8433",
+            description="Computer Organization", available_seats=seats,
+            instruction_type="In Person", schedule="TTH 03:30 PM",
+        )
+        with engine.begin() as conn:
+            upsert_section(conn, status)
+
+
 # ── POST /watches ───────────────────────────────────────────────────────
 
 def test_create_watch_for_existing_section():
@@ -214,3 +228,88 @@ def test_list_notifications_with_data():
     data = resp.get_json()
     assert len(data) == 1
     assert data[0]["status"] == "sent"
+
+
+# ── POST /watches/course ───────────────────────────────────────────────
+
+def test_course_watch_creates_watches_for_all_sections():
+    app = _make_app()
+    _seed_two_sections(app)
+
+    with app.test_client() as client:
+        resp = client.post("/watches/course", json={
+            "email": "alice@unc.edu",
+            "term": "2026 Fall",
+            "subject": "COMP",
+            "catalog_number": "311",
+        })
+
+    assert resp.status_code == 201
+    data = resp.get_json()
+    assert data["message"] == "Created 2 watch(es)"
+    assert len(data["sections"]) == 2
+    assert all(s["status"] == "created" for s in data["sections"])
+
+
+def test_course_watch_partial_duplicate():
+    """If already watching one section, it should still create the other."""
+    app = _make_app()
+    _seed_two_sections(app)
+
+    with app.test_client() as client:
+        # Watch section 001 first
+        client.post("/watches", json={
+            "email": "alice@unc.edu",
+            "term": "2026 Fall",
+            "subject": "COMP",
+            "catalog_number": "311",
+            "class_section": "001",
+        })
+
+        # Now watch the whole course
+        resp = client.post("/watches/course", json={
+            "email": "alice@unc.edu",
+            "term": "2026 Fall",
+            "subject": "COMP",
+            "catalog_number": "311",
+        })
+
+    assert resp.status_code == 201
+    data = resp.get_json()
+    assert data["message"] == "Created 1 watch(es), 1 already existed"
+
+    statuses = {s["class_section"]: s["status"] for s in data["sections"]}
+    assert statuses["001"] == "already_watching"
+    assert statuses["002"] == "created"
+
+
+def test_course_watch_all_duplicates():
+    """If already watching all sections, return 409."""
+    app = _make_app()
+    _seed_two_sections(app)
+
+    with app.test_client() as client:
+        client.post("/watches/course", json={
+            "email": "alice@unc.edu",
+            "term": "2026 Fall",
+            "subject": "COMP",
+            "catalog_number": "311",
+        })
+        resp = client.post("/watches/course", json={
+            "email": "alice@unc.edu",
+            "term": "2026 Fall",
+            "subject": "COMP",
+            "catalog_number": "311",
+        })
+
+    assert resp.status_code == 409
+    assert "Already watching all sections" in resp.get_json()["message"]
+
+
+def test_course_watch_missing_fields():
+    app = _make_app()
+
+    with app.test_client() as client:
+        resp = client.post("/watches/course", json={"email": "alice@unc.edu"})
+
+    assert resp.status_code == 400
