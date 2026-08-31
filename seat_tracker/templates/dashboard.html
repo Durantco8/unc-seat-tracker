@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>UNC Seat Tracker</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; max-width: 800px; margin: 0 auto; padding: 24px; color: #1a1a1a; background: #f8f9fa; }
+    h1 { margin-bottom: 4px; color: #4b9cd3; }
+    .subtitle { color: #666; margin-bottom: 24px; font-size: 14px; }
+
+    /* Email bar */
+    .email-bar { display: flex; gap: 8px; margin-bottom: 24px; }
+    .email-bar input { flex: 1; padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+    .email-bar button { padding: 8px 16px; background: #4b9cd3; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; }
+    .email-bar button:hover { background: #3a8bc2; }
+
+    /* Cards */
+    .card { background: white; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.1); }
+    .card h2 { font-size: 16px; margin-bottom: 12px; color: #333; }
+
+    /* Forms */
+    .form-row { display: flex; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    .form-row input, .form-row select { padding: 8px 12px; border: 1px solid #ccc; border-radius: 6px; font-size: 14px; }
+    .form-row input { flex: 1; min-width: 100px; }
+    .form-row button { padding: 8px 16px; background: #4b9cd3; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; white-space: nowrap; }
+    .form-row button:hover { background: #3a8bc2; }
+
+    /* Watch list */
+    .watch-list { list-style: none; }
+    .watch-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid #eee; }
+    .watch-item:last-child { border-bottom: none; }
+    .watch-info { flex: 1; }
+    .watch-course { font-weight: 600; }
+    .watch-detail { font-size: 13px; color: #666; margin-top: 2px; }
+    .seats { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 13px; font-weight: 600; }
+    .seats-available { background: #d4edda; color: #155724; }
+    .seats-full { background: #f8d7da; color: #721c24; }
+    .btn-remove { padding: 4px 12px; background: #dc3545; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    .btn-remove:hover { background: #c82333; }
+
+    /* Status messages */
+    .status { padding: 10px; border-radius: 6px; margin-bottom: 12px; font-size: 14px; display: none; }
+    .status-success { background: #d4edda; color: #155724; display: block; }
+    .status-error { background: #f8d7da; color: #721c24; display: block; }
+
+    .empty { color: #999; font-style: italic; padding: 12px 0; }
+
+    /* Notifications */
+    .notif-item { padding: 8px 0; border-bottom: 1px solid #eee; font-size: 14px; }
+    .notif-item:last-child { border-bottom: none; }
+    .notif-status { font-size: 12px; padding: 2px 6px; border-radius: 4px; }
+    .notif-sent { background: #d4edda; color: #155724; }
+    .notif-failed { background: #f8d7da; color: #721c24; }
+    .notif-pending { background: #fff3cd; color: #856404; }
+    .notif-dead { background: #e2e3e5; color: #383d41; }
+  </style>
+</head>
+<body>
+
+<h1>UNC Seat Tracker</h1>
+<p class="subtitle">Watch class sections and get notified when seats open up.</p>
+
+<div class="email-bar">
+  <input type="email" id="email" placeholder="Your email (e.g. you@unc.edu)">
+  <button onclick="loadAll()">Load</button>
+</div>
+
+<div id="status" class="status"></div>
+
+<!-- Add watch -->
+<div class="card">
+  <h2>Add a Watch</h2>
+  <div class="form-row">
+    <input id="term" placeholder="Term" value="2026 Fall">
+    <input id="subject" placeholder="Subject" value="COMP">
+    <input id="catalog" placeholder="Catalog #" value="">
+    <input id="section" placeholder="Section (blank = all)">
+  </div>
+  <div class="form-row">
+    <button onclick="addWatch()">Watch Section</button>
+    <button onclick="addCourseWatch()">Watch All Sections</button>
+  </div>
+</div>
+
+<!-- Current watches -->
+<div class="card">
+  <h2>My Watches</h2>
+  <ul class="watch-list" id="watches">
+    <li class="empty">Enter your email and click Load.</li>
+  </ul>
+</div>
+
+<!-- Notification history -->
+<div class="card">
+  <h2>Notification History</h2>
+  <div id="notifications">
+    <p class="empty">No notifications yet.</p>
+  </div>
+</div>
+
+<script>
+  function getEmail() {
+    const email = document.getElementById("email").value.trim();
+    if (!email) { showStatus("Enter your email first.", "error"); return null; }
+    return email;
+  }
+
+  function showStatus(msg, type) {
+    const el = document.getElementById("status");
+    el.textContent = msg;
+    el.className = "status " + (type === "error" ? "status-error" : "status-success");
+    setTimeout(() => { el.className = "status"; }, 5000);
+  }
+
+  async function loadAll() {
+    const email = getEmail();
+    if (!email) return;
+    await loadWatches(email);
+    await loadNotifications(email);
+  }
+
+  async function loadWatches(email) {
+    const resp = await fetch("/watches?email=" + encodeURIComponent(email));
+    const data = await resp.json();
+    const list = document.getElementById("watches");
+
+    if (data.length === 0) {
+      list.innerHTML = '<li class="empty">No watches yet. Add one above.</li>';
+      return;
+    }
+
+    list.innerHTML = data.map(w => {
+      const s = w.section;
+      const seatsClass = s.available_seats > 0 ? "seats-available" : "seats-full";
+      return `
+        <li class="watch-item">
+          <div class="watch-info">
+            <span class="watch-course">${s.subject} ${s.catalog_number} section ${s.class_section}</span>
+            <span class="seats ${seatsClass}">${s.available_seats} seats</span>
+            <div class="watch-detail">${s.description} &middot; ${s.term}</div>
+          </div>
+          <button class="btn-remove" onclick="removeWatch(${w.id})">Remove</button>
+        </li>`;
+    }).join("");
+  }
+
+  async function loadNotifications(email) {
+    const resp = await fetch("/notifications?email=" + encodeURIComponent(email));
+    const data = await resp.json();
+    const container = document.getElementById("notifications");
+
+    if (data.length === 0) {
+      container.innerHTML = '<p class="empty">No notifications yet.</p>';
+      return;
+    }
+
+    container.innerHTML = data.map(n => {
+      const statusClass = "notif-" + n.status;
+      const time = n.sent_at ? new Date(n.sent_at).toLocaleString() : "pending";
+      return `
+        <div class="notif-item">
+          <span class="notif-status ${statusClass}">${n.status}</span>
+          ${n.section} &middot; ${time}
+          <div style="color:#666;font-size:13px">${n.message}</div>
+        </div>`;
+    }).join("");
+  }
+
+  async function addWatch() {
+    const email = getEmail();
+    if (!email) return;
+
+    const body = {
+      email: email,
+      term: document.getElementById("term").value.trim(),
+      subject: document.getElementById("subject").value.trim(),
+      catalog_number: document.getElementById("catalog").value.trim(),
+      class_section: document.getElementById("section").value.trim(),
+    };
+
+    if (!body.catalog_number || !body.class_section) {
+      showStatus("Catalog number and section are required for a specific watch.", "error");
+      return;
+    }
+
+    const resp = await fetch("/watches", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+
+    if (resp.ok) {
+      showStatus("Watch created for " + body.subject + " " + body.catalog_number + " section " + body.class_section, "success");
+      await loadWatches(email);
+    } else {
+      showStatus(data.error, "error");
+    }
+  }
+
+  async function addCourseWatch() {
+    const email = getEmail();
+    if (!email) return;
+
+    const body = {
+      email: email,
+      term: document.getElementById("term").value.trim(),
+      subject: document.getElementById("subject").value.trim(),
+      catalog_number: document.getElementById("catalog").value.trim(),
+    };
+
+    if (!body.catalog_number) {
+      showStatus("Catalog number is required.", "error");
+      return;
+    }
+
+    const resp = await fetch("/watches/course", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+
+    if (resp.ok) {
+      showStatus(data.message, "success");
+      await loadWatches(email);
+    } else {
+      showStatus(data.error || data.message, "error");
+    }
+  }
+
+  async function removeWatch(watchId) {
+    const email = getEmail();
+    if (!email) return;
+
+    const resp = await fetch("/watches/" + watchId + "?email=" + encodeURIComponent(email), {
+      method: "DELETE",
+    });
+
+    if (resp.ok) {
+      showStatus("Watch removed.", "success");
+      await loadWatches(email);
+    } else {
+      const data = await resp.json();
+      showStatus(data.error, "error");
+    }
+  }
+</script>
+
+</body>
+</html>

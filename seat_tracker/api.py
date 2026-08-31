@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 
 import sqlalchemy as sa
 
@@ -27,6 +27,12 @@ def create_app(db_path: str = "seat_tracker.db") -> Flask:
 
     # Store the engine on the app so tests can access it
     app.config["DB_ENGINE"] = engine
+
+    # ── Dashboard ───────────────────────────────────────────────────────
+
+    @app.get("/")
+    def dashboard():
+        return render_template("dashboard.html")
 
     # ── POST /watches ───────────────────────────────────────────────────
 
