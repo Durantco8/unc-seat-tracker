@@ -129,6 +129,73 @@ def upsert_section(conn, status) -> tuple[int, int | None]:
     return result.inserted_primary_key[0], None
 
 
+def get_section_by_identity(conn, term, subject, catalog_number, class_section):
+    """Look up a section by its natural key. Returns the row or None."""
+    return conn.execute(
+        sa.select(sections).where(
+            sections.c.term == term,
+            sections.c.subject == subject,
+            sections.c.catalog_number == catalog_number,
+            sections.c.class_section == class_section,
+        )
+    ).first()
+
+
+def get_watches_for_user(conn, user_email: str) -> list[sa.Row]:
+    """Return all watches for a user, joined with section info."""
+    return conn.execute(
+        sa.select(
+            watches.c.id,
+            watches.c.user_email,
+            watches.c.active,
+            watches.c.created_at,
+            sections.c.term,
+            sections.c.subject,
+            sections.c.catalog_number,
+            sections.c.class_section,
+            sections.c.description,
+            sections.c.available_seats,
+        )
+        .select_from(watches.join(sections, watches.c.section_id == sections.c.id))
+        .where(watches.c.user_email == user_email)
+        .order_by(watches.c.created_at.desc())
+    ).fetchall()
+
+
+def delete_watch(conn, watch_id: int, user_email: str) -> bool:
+    """Delete a watch by id, scoped to the user's email. Returns True if deleted."""
+    result = conn.execute(
+        watches.delete().where(
+            watches.c.id == watch_id,
+            watches.c.user_email == user_email,
+        )
+    )
+    return result.rowcount > 0
+
+
+def get_notifications_for_user(conn, user_email: str) -> list[sa.Row]:
+    """Return notification history for a user, most recent first."""
+    return conn.execute(
+        sa.select(
+            notifications.c.id,
+            notifications.c.message,
+            notifications.c.sent_at,
+            notifications.c.status,
+            notifications.c.attempts,
+            sections.c.subject,
+            sections.c.catalog_number,
+            sections.c.class_section,
+        )
+        .select_from(
+            notifications
+            .join(watches, notifications.c.watch_id == watches.c.id)
+            .join(sections, watches.c.section_id == sections.c.id)
+        )
+        .where(watches.c.user_email == user_email)
+        .order_by(notifications.c.id.desc())
+    ).fetchall()
+
+
 def get_active_watchers(conn, section_id: int) -> list[sa.Row]:
     """Return all active watches for a given section."""
     return conn.execute(
