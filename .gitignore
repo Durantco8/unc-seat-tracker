@@ -4,3 +4,4 @@ __pycache__/
 *.egg-info/
 .env
 PROJECT_BRIEF_PERSONAL.md
+seat-tracker-project-brief.md
