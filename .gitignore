@@ -3,5 +3,9 @@ __pycache__/
 .venv/
 *.egg-info/
 .env
+*.db
+*.db-shm
+*.db-wal
+scripts/test_real_email.py
 PROJECT_BRIEF_PERSONAL.md
 seat-tracker-project-brief.md
