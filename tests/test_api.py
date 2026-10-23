@@ -313,3 +313,53 @@ def test_course_watch_missing_fields():
         resp = client.post("/watches/course", json={"email": "alice@unc.edu"})
 
     assert resp.status_code == 400
+
+
+# ── Term normalization ─────────────────────────────────────────────────
+
+def _fake_check_seats_normalizing(term, subject, catalog_number):
+    """Mimic UNC: whatever term format is typed, results say '2027 Spring'."""
+    return [
+        SectionStatus(
+            term="2027 Spring", subject=subject, catalog_number=catalog_number,
+            class_section=section, class_number="9000",
+            description="Software Engineering", available_seats=0,
+            instruction_type="In Person", schedule="MWF 10:10 AM",
+        )
+        for section in ("001", "002")
+    ]
+
+
+def test_course_watch_with_differently_formatted_term(monkeypatch):
+    """Typing 'Spring 2027' should work even though UNC returns '2027 Spring'."""
+    monkeypatch.setattr("seat_tracker.api.check_seats", _fake_check_seats_normalizing)
+    app = _make_app()
+
+    with app.test_client() as client:
+        resp = client.post("/watches/course", json={
+            "email": "alice@unc.edu",
+            "term": "Spring 2027",
+            "subject": "COMP",
+            "catalog_number": "455",
+        })
+
+    assert resp.status_code == 201
+    assert resp.get_json()["message"] == "Created 2 watch(es)"
+
+
+def test_create_watch_with_differently_formatted_term(monkeypatch):
+    """Single-section watch should also find the section under UNC's term."""
+    monkeypatch.setattr("seat_tracker.api.check_seats", _fake_check_seats_normalizing)
+    app = _make_app()
+
+    with app.test_client() as client:
+        resp = client.post("/watches", json={
+            "email": "alice@unc.edu",
+            "term": "Spring 2027",
+            "subject": "COMP",
+            "catalog_number": "455",
+            "class_section": "002",
+        })
+
+    assert resp.status_code == 201
+    assert resp.get_json()["section"]["class_section"] == "002"

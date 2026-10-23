@@ -75,6 +75,10 @@ def create_app(db_path: str = "seat_tracker.db") -> Flask:
                 for status in results:
                     upsert_section(conn, status)
 
+            # UNC normalizes the term (e.g. "Spring 2027" → "2027 Spring"),
+            # so look up using the term it returned, not the one typed in
+            term = results[0].term
+
             with engine.connect() as conn:
                 section = get_section_by_identity(
                     conn, term, subject, catalog_number, class_section,
@@ -150,9 +154,11 @@ def create_app(db_path: str = "seat_tracker.db") -> Flask:
         created_count = 0
 
         for status in results:
+            # Use the scraped identity — UNC may normalize the typed-in term
             with engine.connect() as conn:
                 section = get_section_by_identity(
-                    conn, term, subject, catalog_number, status.class_section,
+                    conn, status.term, status.subject, status.catalog_number,
+                    status.class_section,
                 )
 
             try:
